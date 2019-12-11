@@ -1,0 +1,398 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  ProjectId:
+    Type: String
+    Description: Project ID from Amazon Pinpoint
+  EngagementScoreDefinitionTableName:
+    Type: String
+    Default: "engagementScoreDefinition"
+    Description: Name of the DynamoDB table to persist the engagement score rules
+  UserEngagementScoreTableName:
+    Type: String
+    Default: "userEngagementScore"
+    Description: Name of the DynamoDB table to persist end user engagement scores
+
+Resources:
+  PinpointKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+      Tags:
+        -
+          Key: "Name"
+          Value: "Pinpoint Event Firehose Stream Destination"
+
+  PinpointApplicationEventStream:
+    Type: AWS::Pinpoint::EventStream
+    Properties:
+      ApplicationId: !Ref ProjectId
+      DestinationStreamArn: !GetAtt PinpointKinesisStream.Arn
+      RoleArn: !GetAtt PinpointKinesisStreamRole.Arn
+
+  PinpointKinesisStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pinpoint.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "kinesis:PutRecords"
+                  - "kinesis:DescribeStream"
+                Resource: !GetAtt PinpointKinesisStream.Arn
+
+  ScoreDefinitionDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "EventType"
+          AttributeType: "S"
+        -
+          AttributeName: "PinpointProjectId"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "EventType"
+          KeyType: "HASH"
+        -
+          AttributeName: "PinpointProjectId"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: !Ref EngagementScoreDefinitionTableName
+
+  UserEngagementScoreDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "UserId"
+          AttributeType: "S"
+        -
+          AttributeName: "PinpointProjectId"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "UserId"
+          KeyType: "HASH"
+        -
+          AttributeName: "PinpointProjectId"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: !Ref UserEngagementScoreTableName
+      StreamSpecification:
+        StreamViewType: "NEW_IMAGE"
+
+
+  PinpointEventStreamLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt PinpointEventStreamLambdaRole.Arn
+      Runtime: "python3.7"
+      Timeout: 60
+      Environment:
+        Variables:
+          PINPOINT_PROJECT_ID: !Ref ProjectId
+          LOG_LEVEL: 'DEBUG'
+          SCORING_DEFINITION_TABLE: !Ref ScoreDefinitionDynamoDBTable
+          USER_SCORE_TABLE: !Ref UserEngagementScoreDynamoDBTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import base64
+          import os
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          pinpoint = boto3.client('pinpoint')
+
+          PINPOINT_PROJECT_ID = os.environ.get('USER_SCORE_TABLE')
+          scoring_definition_table = dynamodb.Table(os.environ.get('SCORING_DEFINITION_TABLE'))
+          user_score_table = dynamodb.Table(os.environ.get('USER_SCORE_TABLE'))
+
+
+          def lambda_handler(event, context):
+
+            global log_level
+              log_level = str(os.environ.get('LOG_LEVEL')).upper()
+              if log_level not in [
+                                      'DEBUG', 'INFO',
+                                      'WARNING', 'ERROR',
+                                      'CRITICAL'
+                                  ]:
+                  log_level = 'ERROR'
+              logging.getLogger().setLevel(log_level)
+
+
+            for record in event['Records']:
+              try:
+                payload = json.loads(base64.b64decode(record["kinesis"]["data"]))
+
+                scoreDefn = get_score_definition(payload['event_type'])
+
+                endpoint = get_endpoint(payload['client']['client_id'])
+
+                update_user_score(endpoint['User']['UserId'], scoreDefn['ScoreOffset'])
+
+              except Exception as e:
+                logging.error('Received Error while processing payload: %s', e)
+
+
+          def get_score_definition(event_type):
+            try:
+              response = scoring_definition_table.get_item(
+                Key={
+                  'EventType': event_type,
+                  'PinpointProjectId': PINPOINT_PROJECT_ID
+                }
+              )
+            except ClientError as e:
+              logging.error('get_score_definition error: %s', e)
+              raise e
+            else:
+              item = response['Item']
+              return item
+
+          def get_endpoint(endpoint_id):
+            try:
+              response = pinpoint.get_endpoint(
+                ApplicationId=PINPOINT_PROJECT_ID,
+                EndpointId=endpoint_id
+              )
+            except Exception as e:
+              logging.error('get_endpoint error: %s', e)
+              raise e
+            else:
+              return response['EndpointResponse']
+
+          def update_user_score(user_id, score_offset):
+            try:
+              resposne user_score_table.update_item(
+                Key={
+                  'UserId': user_id,
+                  'PinpointProjectId': PINPOINT_PROJECT_ID
+                },
+                ExpressionAttributeNames = {
+                  '#Score': 'Score'
+                },
+                ExpressionAttributeValues = {
+                  ':score_offset': {
+                    'N': score_offset,
+                  },
+                },
+                UpdateExpression = 'ADD #Score :score_offset',
+                ReturnValues = 'UPDATED_NEW'
+              )
+            except ClientError as e:
+              logging.error('update_user_score error: %s', e)
+              raise e
+
+  PinpointEventStreamLambdaSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt PinpointKinesisStream.Arn
+      FunctionName: !GetAtt PinpointEventStreamLambda.Arn
+      StartingPosition: "TRIM_HORIZON"
+
+  UpdatePinpointLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt UpdatePinpointLambdaRole.Arn
+      Runtime: "python3.7"
+      Timeout: 60
+      Environment:
+        Variables:
+          PINPOINT_PROJECT_ID: !Ref ProjectId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import base64
+          import os
+          from botocore.exceptions import ClientError
+
+          pinpoint = boto3.client('pinpoint')
+
+          PINPOINT_PROJECT_ID = os.environ.get('USER_SCORE_TABLE')
+
+          def lambda_handler(event, context):
+
+            global log_level
+              log_level = str(os.environ.get('LOG_LEVEL')).upper()
+              if log_level not in [
+                                      'DEBUG', 'INFO',
+                                      'WARNING', 'ERROR',
+                                      'CRITICAL'
+                                  ]:
+                  log_level = 'ERROR'
+              logging.getLogger().setLevel(log_level)
+
+
+            for record in event['Records']:
+              try:
+                payload = record['dynamodb']['NewImage']
+                user_id = payload['UserId']['S']
+                project_id = payload['PinpointProjectId']['S']
+                score = payload['Score']['N']
+
+                endpoints = get_endpoints_for_user(user_id, project_id)
+
+                for endpoint in endpoings:
+                  endpoint['User']['UserAttributes']['EngagementScore'] = [score]
+                  update_score_for_endpoint(project_id, endpoint)
+
+              except Exception as e:
+                logging.error('Received Error while processing payload: %s', e)
+
+          def get_endpoints_for_user(user_id, project_id):
+            try:
+              response = pinpoint.get_user_endpoints(
+                ApplicationId: project_id,
+                UserId: user_id
+              )
+            except Exception as e:
+              logging.error('get_endpoints_for_user error: %s', e)
+              raise e
+            else:
+              return response['EndpointsResponse']['Item']
+
+          def update_score_for_endpoint(project_id, endpoint):
+            try:
+              pinpoint.update_endpoint(
+                ApplicationId: project_id,
+                EndpointId, endpoint['Id'],
+                EndpointRequest: endpoint
+              )
+            except Exception as e:
+              logging.error('update_score_for_endpoint error: %s', e)
+              raise e
+
+
+  UpdatePinpointLambdaSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt UserEngagementScoreDynamoDBTable.StreamArn
+      FunctionName: !GetAtt UpdatePinpointLambda.Arn
+      StartingPosition: "TRIM_HORIZON"
+
+  PinpointEventStreamLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "kinesis:DescribeStream"
+                  - "kinesis:DescribeStreamSummary"
+                  - "kinesis:GetRecords"
+                  - "kinesis:GetShardIterator"
+                  - "kinesis:ListShards"
+                  - "kinesis:ListStreams"
+                  - "kinesis:SubscribeToShard"
+                Resource: !GetAtt PinpointKinesisStream.Arn
+              -
+                Effect: "Allow"
+                Action:
+                  - "mobiletargeting:GetEndpoint"
+                Resource:
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${ProjectId}"
+              -
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:GetItem"
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ScoreDefinitionDynamoDBTable}"
+              -
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:UpdateItem"
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${UserEngagementScoreDynamoDBTable}"
+
+  UpdatePinpointLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              -
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:ListStreams"
+                Resource: !GetAtt UserEngagementScoreDynamoDBTable.StreamArn
+              -
+                Effect: "Allow"
+                Action:
+                  - "mobiletargeting:UpdateEndpoint"
+                  - "mobiletargeting:GetUserEndpoints"
+                Resource:
+                  - !Sub "arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${ProjectId}"
