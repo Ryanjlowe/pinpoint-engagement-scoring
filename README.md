@@ -12,6 +12,13 @@ Main files:
 ├── README.MD                                           <-- This instructions file
 ├── cloudformation                                      <-- Folder for the AWS CloudFormation Templates
 │   └── template.yaml                                   <-- Template to configure the solution
+├── lambdas                                             <-- Folder for the AWS CloudFormation Templates
+│   └── IntializeDBCustomLambda
+│       └── index.py                                    <-- Custom Resource used to populate DynamoDB tables
+│   └── PinpointEventStreamLambda
+│       └── index.py                                    <-- Function to process the Pinpoint Event Stream
+│   └── UpdatePinpointLambda
+│       └── index.py                                    <-- Function to update Pinpoint with new Score values
 ```
 
 ## Solution
